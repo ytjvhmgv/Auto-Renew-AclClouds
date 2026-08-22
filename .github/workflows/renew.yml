@@ -34,13 +34,12 @@ jobs:
           pip install seleniumbase aiohttp requests
           seleniumbase install chromedriver
 
-      - name: 🌐 设置sing-box代理转发
-        continue-on-error: true
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-          
+      - name: 启用 WARP 网络
+        uses: fscarmen/warp-on-actions@v1.4
+        with:
+          stack: dual
+          mode: client
+
       - name: 🚀 运行续期脚本
         env:
           EMAIL: ${{ secrets.EMAIL }}
