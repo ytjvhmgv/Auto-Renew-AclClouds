@@ -4,6 +4,8 @@
 import os
 import re
 import time
+import shutil
+import subprocess
 import requests
 from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
@@ -858,31 +860,128 @@ def login(sb, email, password):
         print(f"登录过程异常: {e}")
         return False
     
-# 获取当前出口ip
-def get_current_ip(proxy_server: str = "") -> str:
-    proxies = None
-    if proxy_server:
-        proxies = {"http": proxy_server, "https": proxy_server}
-    response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-    response.raise_for_status()
-    return response.text.strip()
+# 获取当前出口ip（WARP 为系统级网络，无需再走代理）
+def _curl_ip(ipv6):
+    flag = "-6" if ipv6 else "-4"
+    urls = (
+        ("https://api64.ipify.org", "https://ipv6.icanhazip.com", "https://api-ipv6.ip.sb/ip")
+        if ipv6 else
+        ("https://api.ipify.org", "https://ipv4.icanhazip.com", "https://api-ipv4.ip.sb/ip")
+    )
+    for url in urls:
+        try:
+            proc = subprocess.run(
+                ["curl", flag, "-sS", "--max-time", "10", url],
+                capture_output=True, text=True, timeout=15,
+            )
+            ip = (proc.stdout or "").strip()
+            if proc.returncode == 0 and ip and " " not in ip and "<" not in ip:
+                return ip
+        except Exception:
+            continue
+    return ""
 
-def main():
 
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    PROXY_SERVER = os.getenv('S5_PROXY') or os.getenv('PROXY_SERVER') or "socks://127.0.0.1:1080"
+def print_exit_ips(prefix="当前"):
+    v4 = _curl_ip(False)
+    v6 = _curl_ip(True)
+    print("📍 %s IPv4: %s" % (prefix, v4 or "无"))
+    print("📍 %s IPv6: %s" % (prefix, v6 or "无"))
+    return v4, v6
 
-    sb_options = {'uc': True, 'headless': False}
-    if IS_PROXY:
-        sb_options['proxy'] = PROXY_SERVER
-        print(f"🔗 挂载代理: {PROXY_SERVER}")
-    else:
-        print("🍭 未使用代理，直连访问")
 
+def get_current_ip():
+    v4, v6 = print_exit_ips("当前")
+    return v6 or v4 or ""
+
+
+def _warp_cli(*args, check=False):
+    return subprocess.run(
+        ["sudo", "warp-cli", "--accept-tos"] + list(args),
+        check=check, timeout=30, capture_output=True, text=True,
+    )
+
+
+def prefer_ipv6():
+    try:
+        subprocess.run(["sudo", "sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=0"], check=False, timeout=10, capture_output=True)
+        subprocess.run(["sudo", "sysctl", "-w", "net.ipv6.conf.default.disable_ipv6=0"], check=False, timeout=10, capture_output=True)
+        subprocess.run(
+            ["sudo", "bash", "-c", "grep -q 'precedence ::/0 100' /etc/gai.conf 2>/dev/null || echo 'precedence ::/0 100' >> /etc/gai.conf"],
+            check=False, timeout=10, capture_output=True,
+        )
+    except Exception as e:
+        print("⚠️ 配置 IPv6 优先失败: %s" % e)
+
+
+def wait_warp_connected(timeout=40):
+    start = time.time()
+    last = ""
+    while time.time() - start < timeout:
+        proc = _warp_cli("status")
+        last = "%s%s" % (proc.stdout or "", proc.stderr or "")
+        if "Connected" in last and "Disconnected" not in last:
+            return True
+        time.sleep(2)
+    print("⚠️ WARP 未进入 Connected 状态: %s" % ((last.strip()[:300]) or "empty"))
+    return False
+
+
+def reset_warp_identity():
+    _warp_cli("disconnect")
+    time.sleep(1)
+    _warp_cli("registration", "delete")
+    subprocess.run(["sudo", "systemctl", "stop", "warp-svc"], check=False, timeout=30, capture_output=True)
+    subprocess.run(["sudo", "rm", "-rf", "/var/lib/cloudflare-warp"], check=False, timeout=30, capture_output=True)
+    subprocess.run(["sudo", "systemctl", "start", "warp-svc"], check=False, timeout=30, capture_output=True)
+    time.sleep(4)
+    _warp_cli("registration", "new", check=True)
+    mode = _warp_cli("mode", "warp")
+    if mode.returncode:
+        print("⚠️ 切换 warp mode 失败: %s" % ((mode.stderr or mode.stdout or "").strip()[:200]))
+    _warp_cli("connect", check=True)
+    wait_warp_connected(40)
+    time.sleep(5)
+
+
+def restart_warp(max_rounds=3):
+    if not shutil.which("warp-cli"):
+        print("⚠️ 未找到 warp-cli，跳过 WARP 重连（本地直连运行时无需此步骤）")
+        return False
+    prefer_ipv6()
+    print("🔄 正在重启 WARP 以更换出口（优先切换 IPv6）...")
+    old_v4, old_v6 = print_exit_ips("当前")
+    last_v4, last_v6 = old_v4, old_v6
+    for round_i in range(1, max_rounds + 1):
+        print("  ↻ 第 %s/%s 轮重置 WARP 身份..." % (round_i, max_rounds))
+        try:
+            reset_warp_identity()
+        except Exception as e:
+            print("  ⚠️ 重置异常: %s" % e)
+            continue
+        last_v4, last_v6 = print_exit_ips("新")
+        v4_changed = bool(last_v4 and last_v4 != old_v4)
+        v6_changed = bool(last_v6 and last_v6 != old_v6)
+        if last_v6:
+            print("  ✅ 已拿到 IPv6: %s" % last_v6)
+        else:
+            print("  ⚠️ 仍未拿到 IPv6，继续尝试...")
+        if v4_changed or v6_changed:
+            print("✅ WARP 出口已切换  IPv4 %s -> %s  IPv6 %s -> %s" % (old_v4 or "无", last_v4 or "无", old_v6 or "无", last_v6 or "无"))
+            return True
+        print("  ⚠️ 出口 IP 未变化，继续重置...")
+    print("❌ WARP 未能换到新 IP（IPv4=%s, IPv6=%s）" % (last_v4 or "无", last_v6 or "无"))
+    return False
+
+def run_browser_session() -> bool:
+    """单次浏览器会话。登录失败返回 False 以便更换 WARP IP 重试。"""
+    print("🌐 使用 Cloudflare WARP 网络（系统级，不再使用 sing-box 代理）")
+    sb_options = {'uc': True, 'headless': False, 'chromium_arg': '--enable-ipv6'}
+
+    print("🚀 启动浏览器...")
     with SB(**sb_options) as sb:   # 本地调试 headless=False，CI 改为 True
         try:
-            ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
-            print(f"📍 当前出口IP: {ip}")
+            print_exit_ips("浏览器会话")
         except Exception as e:
             print(f"获取出口IP失败: {e}")
 
@@ -894,19 +993,18 @@ def main():
             time.sleep(2)
 
         if is_login_page(sb):
-            print("执行正常登录...")
             if not EMAIL or not PASSWORD:
-                print("❌ 未配置 ACL_EMAIL 或 ACL_PASSWORD，无法执行账号密码登录。")
-                send_telegram("⚠️ 未配置 ACL_EMAIL 或 ACL_PASSWORD。")
-                return
+                print("❌ 未配置 EMAIL 或 PASSWORD，无法执行账号密码登录。")
+                send_telegram("⚠️ 未配置 EMAIL 或 PASSWORD。")
+                return True
             if not login(sb, EMAIL, PASSWORD):
-                return
+                print("❌ 登录失败")
+                return False
         elif is_logged_in(sb):
             print(f"✅ 当前已登录。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
         else:
             print(f"❌ 未能确认登录状态。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
-            send_telegram("⚠️ 未能确认登录状态，请检查账号密码配置。")
-            return
+            return False
 
         # 2. 进入项目页
         sb.open(PROJECTS_URL)
@@ -920,7 +1018,7 @@ def main():
             print("❌ 未找到项目卡片。")
             log_projects_page_diagnostics(sb)
             send_telegram("⚠️ 未找到项目卡片，请检查页面结构。")
-            return
+            return True
 
         print(f"找到 {len(cards)} 个项目卡片。")
         for idx, card in enumerate(cards, 1):
@@ -951,6 +1049,27 @@ def main():
                 send_telegram(f"🇫🇷 Aclclouds 续期通知\n\n⚠️ 处理出错: {str(e)}")
 
         print("所有项目处理完成。")
+        return True
+
+
+def main():
+    print("#" * 25)
+    print("   AclClouds 自动续期")
+    print("#" * 25)
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        print(f"\n🔁 第 {attempt}/{max_attempts} 次尝试")
+        if attempt > 1:
+            print("先更换 WARP IP 再重新登录...")
+            if not restart_warp():
+                print("⚠️ WARP 未能更换 IP，停止重试")
+                break
+        if run_browser_session():
+            return
+
+    print("\n❌ 多次尝试后仍登录失败，终止后续续期操作。")
+    send_telegram("⚠️ 登录失败，请检查账号密码或 Cloudflare 验证。")
 
 if __name__ == '__main__':
     main()
