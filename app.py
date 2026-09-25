@@ -973,6 +973,7 @@ def restart_warp(max_rounds=3):
     print("❌ WARP 未能换到新 IP（IPv4=%s, IPv6=%s）" % (last_v4 or "无", last_v6 or "无"))
     return False
 
+
 def run_browser_session() -> bool:
     """单次浏览器会话。登录失败返回 False 以便更换 WARP IP 重试。"""
     print("🌐 使用 Cloudflare WARP 网络（系统级，不再使用 sing-box 代理）")
@@ -987,11 +988,20 @@ def run_browser_session() -> bool:
 
         sb.set_window_size(1366, 768)
 
-        if not is_login_page(sb):
-            sb.open(BASE_URL)
-            sb.wait_for_ready_state_complete()
-            time.sleep(2)
+        # 1. 先尝试访问控制台，检查是否已经拥有有效的会话
+        sb.open(BASE_URL)
+        sb.wait_for_ready_state_complete()
+        time.sleep(2)
 
+        # 2. 如果被重定向到了非 dash 且非 login 页面（比如官网主页 /fr/ 或 /en/），则强制进入登录页
+        if not is_login_page(sb) and not is_logged_in(sb):
+            login_url = f"https://aclclouds.com{LOGIN_PATH}"
+            print(f"未处于登录或控制台页面 (当前: {sb.get_current_url()})，强制前往登录页: {login_url}")
+            sb.open(login_url)
+            sb.wait_for_ready_state_complete()
+            time.sleep(3)
+
+        # 3. 再次判断状态并执行对应逻辑
         if is_login_page(sb):
             if not EMAIL or not PASSWORD:
                 print("❌ 未配置 EMAIL 或 PASSWORD，无法执行账号密码登录。")
@@ -1012,7 +1022,7 @@ def run_browser_session() -> bool:
         time.sleep(3)
 
         # ========================================================
-        # 3. 定位卡片 (已按要求修改为动态索引模式，防止元素刷新失效)
+        # 3. 定位卡片 (动态索引模式，防止元素刷新失效)
         # ========================================================
         initial_cards = find_project_cards(sb)
         total_cards = len(initial_cards)
@@ -1026,10 +1036,10 @@ def run_browser_session() -> bool:
         print(f"找到 {total_cards} 个项目卡片。")
         for idx in range(1, total_cards + 1):
             try:
-                # 【关键修改】：每次循环重新根据当前 DOM 树提取该索引对应的卡片
+                # 每次循环重新根据当前 DOM 树提取该索引对应的卡片
                 card = get_card_by_index(sb, idx)
                 if not card:
-                    print(f"⚠️ 未能重新定位到第 {idx} 个项目卡片，可能页面结构已发生剧烈变化。跳过。")
+                    print(f"⚠️ 未能重新定位到第 {idx} 个项目卡片，可能页面结构已发生变化。跳过。")
                     continue
 
                 project_name = get_project_name(card, idx)
