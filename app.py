@@ -1011,18 +1011,27 @@ def run_browser_session() -> bool:
         sb.wait_for_ready_state_complete()
         time.sleep(3)
 
-        # 3. 定位卡片
-        cards = find_project_cards(sb)
+        # ========================================================
+        # 3. 定位卡片 (已按要求修改为动态索引模式，防止元素刷新失效)
+        # ========================================================
+        initial_cards = find_project_cards(sb)
+        total_cards = len(initial_cards)
 
-        if not cards:
+        if total_cards == 0:
             print("❌ 未找到项目卡片。")
             log_projects_page_diagnostics(sb)
             send_telegram("⚠️ 未找到项目卡片，请检查页面结构。")
             return True
 
-        print(f"找到 {len(cards)} 个项目卡片。")
-        for idx, card in enumerate(cards, 1):
+        print(f"找到 {total_cards} 个项目卡片。")
+        for idx in range(1, total_cards + 1):
             try:
+                # 【关键修改】：每次循环重新根据当前 DOM 树提取该索引对应的卡片
+                card = get_card_by_index(sb, idx)
+                if not card:
+                    print(f"⚠️ 未能重新定位到第 {idx} 个项目卡片，可能页面结构已发生剧烈变化。跳过。")
+                    continue
+
                 project_name = get_project_name(card, idx)
                 old_expiry = get_project_expiry(card)
                 print(f"[{project_name}] 当前过期: {old_expiry}")
