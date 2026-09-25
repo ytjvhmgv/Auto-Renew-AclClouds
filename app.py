@@ -839,12 +839,12 @@ def login(sb, email, password):
             return false;
         ''')
 
-    # ---- 等待登录结果 ----
+    # ---- 等待登录结果 (已去除硬编码的英文 title 断言，兼容多语言) ----
     try:
         wait_for_url_change(sb, login_page_url, timeout=30)
-        if '/auth/login' not in sb.get_current_url():
-            sb.assert_title('Home | ACLClouds')
-            print("✅ 登录成功！")
+        current_url = sb.get_current_url()
+        if '/auth/login' not in current_url:
+            print(f"✅ 登录成功！当前标题: {sb.get_title()}")
             return True
         else:
             # 提取错误信息
@@ -881,7 +881,6 @@ def _curl_ip(ipv6):
             continue
     return ""
 
-
 def print_exit_ips(prefix="当前"):
     v4 = _curl_ip(False)
     v6 = _curl_ip(True)
@@ -889,18 +888,15 @@ def print_exit_ips(prefix="当前"):
     print("📍 %s IPv6: %s" % (prefix, v6 or "无"))
     return v4, v6
 
-
 def get_current_ip():
     v4, v6 = print_exit_ips("当前")
     return v6 or v4 or ""
-
 
 def _warp_cli(*args, check=False):
     return subprocess.run(
         ["sudo", "warp-cli", "--accept-tos"] + list(args),
         check=check, timeout=30, capture_output=True, text=True,
     )
-
 
 def prefer_ipv6():
     try:
@@ -913,7 +909,6 @@ def prefer_ipv6():
     except Exception as e:
         print("⚠️ 配置 IPv6 优先失败: %s" % e)
 
-
 def wait_warp_connected(timeout=40):
     start = time.time()
     last = ""
@@ -925,7 +920,6 @@ def wait_warp_connected(timeout=40):
         time.sleep(2)
     print("⚠️ WARP 未进入 Connected 状态: %s" % ((last.strip()[:300]) or "empty"))
     return False
-
 
 def reset_warp_identity():
     _warp_cli("disconnect")
@@ -942,7 +936,6 @@ def reset_warp_identity():
     _warp_cli("connect", check=True)
     wait_warp_connected(40)
     time.sleep(5)
-
 
 def restart_warp(max_rounds=3):
     if not shutil.which("warp-cli"):
@@ -972,7 +965,6 @@ def restart_warp(max_rounds=3):
         print("  ⚠️ 出口 IP 未变化，继续重置...")
     print("❌ WARP 未能换到新 IP（IPv4=%s, IPv6=%s）" % (last_v4 or "无", last_v6 or "无"))
     return False
-
 
 def run_browser_session() -> bool:
     """单次浏览器会话。登录失败返回 False 以便更换 WARP IP 重试。"""
@@ -1069,7 +1061,6 @@ def run_browser_session() -> bool:
 
         print("所有项目处理完成。")
         return True
-
 
 def main():
     print("#" * 25)
