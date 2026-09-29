@@ -162,11 +162,9 @@ def find_elements(root, selector):
 
 def find_renew_buttons(card):
     """
-    通过 Python 遍历彻底解决多语言（特别是法语）和图标按钮的匹配盲区。
+    通过 Python 遍历彻底解决多语言（法语等）和图标按钮的匹配盲区。
     """
     buttons = []
-    
-    # 1. 直接按通用 CSS 选取
     selectors = ['.projects-renew-btn', '[class*="renew-btn"]', '[class*="reactivate-btn"]']
     for sel in selectors:
         try:
@@ -174,10 +172,8 @@ def find_renew_buttons(card):
         except:
             pass
 
-    # 2. 遍历卡片内所有 button 和 a 角色，匹配语言无关特征
     try:
         elements = card.find_elements(By.XPATH, './/button | .//a | .//*[@role="button"]')
-        # 包括法文的 Renouveler, Réactiver 等
         keywords = ['renew', 'reactivate', 'renouveler', 'reactiver', 'réactiver', '续期', '恢复', '重新激活', 'resume', 'unsuspend']
         
         for elem in elements:
@@ -191,7 +187,7 @@ def find_renew_buttons(card):
             try: texts_to_check.append((elem.get_attribute('aria-label') or '').strip().lower())
             except: pass
             
-            # (A) 文字层级匹配
+            # (A) 文字匹配
             matched_by_text = False
             for t in texts_to_check:
                 if any(kw in t for kw in keywords):
@@ -202,10 +198,9 @@ def find_renew_buttons(card):
             if matched_by_text:
                 continue
                 
-            # (B) 图标层级匹配 (无视页面语言)
+            # (B) 图标匹配 (无视页面语言)
             try:
                 inner_html = (elem.get_attribute('innerHTML') or '').lower()
-                # FontAwesome / SVG 常用恢复和续期图标
                 if 'fa-play' in inner_html or 'fa-sync' in inner_html or 'fa-rotate' in inner_html:
                     buttons.append(elem)
             except:
@@ -213,11 +208,11 @@ def find_renew_buttons(card):
     except Exception as e:
         print(f"查找按钮时出小错: {e}")
         
-    # 去重并只保留可见按钮
     valid_buttons = []
     for b in unique_elements(buttons):
         try:
-            if b.is_displayed(): valid_buttons.append(b)
+            # 哪怕按钮在折叠区域被隐藏，也直接收录，靠后面的 JS 点击强行触发
+            valid_buttons.append(b)
         except:
             pass
     return valid_buttons
@@ -231,7 +226,7 @@ def find_card_container_from_child(sb, child):
           const text = (node.innerText || '').trim();
           const cls = (node.className || '').toString().toLowerCase();
           const looksLikeProject = /renew|reactivate|renouveler|réactiver|suspended|suspendu|expiry|expire|expiré|valid|valide|续期|重新激活|恢复|暂停|过期|到期/i.test(text);
-          const looksLikeCard = /card|project|service|server|item|row/.test(cls);
+          const looksLikeCard = /card|project|service|server|item|row|tr/.test(cls) || node.tagName.toLowerCase() === 'tr';
           if (node !== start && text.length > 20 && (looksLikeProject || looksLikeCard)) {
             return node;
           }
@@ -242,41 +237,52 @@ def find_card_container_from_child(sb, child):
     )
 
 def find_project_cards(sb):
+    # 增加 tr, row 等用于识别新版 Table 布局
     candidate_selectors = [
+        'tr',
+        'tbody tr',
+        '[role="row"]',
+        '[class*="row"]',
         '.projects-card',
         '[class*="projects-card"]',
         '[class*="project"][class*="card"]',
-        '[class*="Project"][class*="Card"]',
         '[class*="service"][class*="card"]',
         '[class*="server"][class*="card"]',
+        '[class*="item"]',
         'article',
     ]
     cards = []
-    # 增加法语关键词匹配
-    keywords_list = ['renew', 'reactivate', 'renouveler', 'réactiver', 'reactiver', 'suspended', 'suspendu', 'expiry', 'expire', 'expiré', 'valid', 'valide', '续期', '重新激活', '恢复', '暂停', '过期', '到期']
+    keywords_list = ['renew', 'reactivate', 'renouveler', 'réactiver', 'reactiver', 'suspended', 'suspendu', 'expiry', 'expire', 'expiré', 'expiration', 'valid', 'valide', 'actif', '续期', '重新激活', '恢复', '暂停', '过期', '到期']
     
     for selector in candidate_selectors:
         try:
             for card in sb.driver.find_elements(By.CSS_SELECTOR, selector):
                 text = element_text(card).lower()
-                if any(keyword in text for keyword in keywords_list):
+                # 包含法语/英语关键词 或 包含日期格式 即被视为疑似卡片
+                if any(keyword in text for keyword in keywords_list) or re.search(r'\d{1,2}[-/]\d{1,2}[-/]\d{4}', text):
                     cards.append(card)
         except Exception:
             continue
 
-    if cards:
-        return dedupe_project_cards(cards)
+    if not cards:
+        for button in find_renew_buttons(sb.driver):
+            try:
+                cards.append(find_card_container_from_child(sb, button))
+            except Exception:
+                continue
 
-    for button in find_renew_buttons(sb.driver):
-        try:
-            cards.append(find_card_container_from_child(sb, button))
-        except Exception:
-            continue
+    raw_deduped = dedupe_project_cards(cards)
+    
+    # 核心过滤：过滤掉统计面板（如 "Expiration dans 30 jours 1"）以及表头行
+    final_cards = []
+    for c in raw_deduped:
+        txt = element_text(c)
+        if extract_date_like(txt) or extract_duration_like(txt):
+            # 如果是表头(MODÈLE/TYPE/ID SERVICE)，剔除
+            if not re.match(r'^(modèle|model|type|id\s+service)\s*', txt, re.I):
+                final_cards.append(c)
 
-    if cards:
-        return dedupe_project_cards(cards)
-
-    return dedupe_project_cards(cards)
+    return final_cards if final_cards else raw_deduped
 
 def extract_date_like(text):
     if not text:
@@ -297,13 +303,11 @@ def extract_duration_like(text):
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     for idx, line in enumerate(lines):
-        # 兼容法语 "expire dans" 或 "restant"
         if re.search(r'expires\s+in|expire\s+dans|restant|剩余|还有', line, re.I) and idx + 1 < len(lines):
             candidate = lines[idx + 1]
             if extract_date_like(candidate) or re.search(r'\d', candidate):
                 return re.sub(r'^(?:expires\s*in|expire\s+dans|restant|剩余|还有)\s*[:：]?\s*', '', candidate, flags=re.I).strip()
 
-    # 兼容法文 jours, heures
     match = re.search(
         r'(?:expires\s*in\s*|expire\s+dans\s*)?(\d+\s*(?:days|day|d|j|jours|jour|天|日)\s*\d*\s*(?:hours|hour|h|heures|heure|小时)?)',
         text,
@@ -319,21 +323,29 @@ def extract_duration_like(text):
     return ''
 
 def get_project_name(card, idx):
+    # 针对 Table 布局，优先抓取第一列 td
     selectors = [
-        '.projects-card-title', 'h1', 'h2', 'h3', 'h4', '[class*="title"]', '[class*="name"]',
+        'td:first-child', '.projects-card-title', 'h1', 'h2', 'h3', 'h4', '[class*="title"]', '[class*="name"]',
     ]
     for selector in selectors:
         try:
             for elem in card.find_elements(By.CSS_SELECTOR, selector):
                 text = element_text(elem)
                 if text and len(text) <= 80 and not re.search(STATE_REGEX, text, re.I) and not extract_duration_like(text):
-                    return text
+                    if text.lower() not in ['modèle', 'model', 'type']:
+                        return text
         except Exception:
             continue
 
+    # 回退到正则拆分，解决 tr 取 text 会把整行黏在一起的问题
     for line in element_text(card).splitlines():
         line = line.strip()
-        if line and len(line) <= 80 and not extract_duration_like(line) and not re.search(STATE_REGEX, line, re.I):
+        if line and len(line) <= 150 and not extract_duration_like(line) and not re.search(STATE_REGEX, line, re.I):
+            if line.lower().startswith('modèle') or line.lower().startswith('model'):
+                continue
+            # 如果是一整行长文本(例如 "bot-free Bot Discord b0531... 03/10/2026")，只提取第一个词作为名字
+            if len(line) > 25 and ' ' in line:
+                return line.split(' ')[0]
             return line
     return f"项目 #{idx}"
 
@@ -386,7 +398,6 @@ def wait_for_renew_result(sb, idx, timeout=30):
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            # 添加法语 success/succès 的支持
             success_xpath = '//div[contains(@class, "modal") and (contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "successfully") or contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "succès"))]'
             success_modals = sb.driver.find_elements(By.XPATH, success_xpath)
             if any(modal.is_displayed() for modal in success_modals):
@@ -423,7 +434,6 @@ def get_renew_note(card):
 
 def get_action_button_label(button):
     text = element_text(button)
-    # 图标按钮没有文字，从 title / aria-label 里取按钮含义
     for attr in ('aria-label', 'title', 'innerHTML'):
         try:
             value = (button.get_attribute(attr) or '').strip()
@@ -450,7 +460,6 @@ def log_projects_page_diagnostics(sb):
     print(f"项目页可见文本摘要: {body_text[:1200]}")
 
 def has_renew_antibot_modal(sb):
-    # 增加法语 human/humain 的匹配
     selectors = [
         '//div[contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "anti-bot")]',
         '//div[contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "human")]',
@@ -466,7 +475,6 @@ def has_renew_antibot_modal(sb):
     return False
 
 def click_captcha_checkbox(sb, label='验证码', timeout=10):
-    """点击 ACLClouds 页面上的人机验证复选框，并处理图形验证码挑战。"""
     selectors = [
         'div.auth-captcha-inner[role="checkbox"]',
         '//div[contains(., "Anti-bot confirmation")]//*[@role="checkbox"]',
@@ -791,7 +799,6 @@ def fill_input(sb, selector, value, label, timeout=15):
     if entered_value != value:
         js_set_input_value(sb, selector, value)
         entered_value = sb.get_value(selector)
-
     return entered_value == value
 
 def login(sb, email, password):
@@ -808,7 +815,6 @@ def login(sb, email, password):
         return False
 
     sb.sleep(1)
-
     login_page_url = sb.get_current_url()
     clicked = False
 
@@ -821,14 +827,15 @@ def login(sb, email, password):
             sb.click(selector)
             clicked = True
             break
-        except Exception as e:
+        except Exception:
             pass
             
     if not clicked:
         sb.execute_script('''
             var els = document.querySelectorAll('div, button, a');
             for (var el of els) {
-                if (el.textContent.trim().toLowerCase().includes('sign in') || el.textContent.trim().toLowerCase().includes('connexion')) {
+                var txt = el.textContent.trim().toLowerCase();
+                if (txt.includes('sign in') || txt.includes('connexion') || txt.includes('login')) {
                     el.click();
                     return true;
                 }
@@ -900,7 +907,7 @@ def prefer_ipv6():
             ["sudo", "bash", "-c", "grep -q 'precedence ::/0 100' /etc/gai.conf 2>/dev/null || echo 'precedence ::/0 100' >> /etc/gai.conf"],
             check=False, timeout=10, capture_output=True,
         )
-    except Exception as e:
+    except Exception:
         pass
 
 def wait_warp_connected(timeout=40):
@@ -930,7 +937,7 @@ def reset_warp_identity():
 
 def restart_warp(max_rounds=3):
     if not shutil.which("warp-cli"):
-        print("⚠️ 未找到 warp-cli，跳过 WARP 重连（本地直连运行时无需此步骤）")
+        print("⚠️ 未找到 warp-cli，跳过 WARP 重连")
         return False
     prefer_ipv6()
     print("🔄 正在重启 WARP 以更换出口（优先切换 IPv6）...")
@@ -940,7 +947,7 @@ def restart_warp(max_rounds=3):
         print("  ↻ 第 %s/%s 轮重置 WARP 身份..." % (round_i, max_rounds))
         try:
             reset_warp_identity()
-        except Exception as e:
+        except Exception:
             continue
         last_v4, last_v6 = print_exit_ips("新")
         v4_changed = bool(last_v4 and last_v4 != old_v4)
@@ -952,6 +959,7 @@ def restart_warp(max_rounds=3):
 
 def run_browser_session() -> bool:
     print("🌐 使用 Cloudflare WARP 网络")
+    # 去除强加英文的参数，顺从你的法语源生页面需要
     sb_options = {'uc': True, 'headless': False, 'chromium_arg': '--enable-ipv6'}
 
     print("🚀 启动浏览器...")
@@ -960,7 +968,6 @@ def run_browser_session() -> bool:
         except: pass
 
         sb.set_window_size(1366, 768)
-
         sb.open(BASE_URL)
         sb.wait_for_ready_state_complete()
         time.sleep(2)
