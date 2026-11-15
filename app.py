@@ -435,18 +435,20 @@ def log_projects_page_diagnostics(sb):
     print(f"项目页可见文本摘要: {body_text[:1200]}")
 
 def has_renew_antibot_modal(sb):
-    selectors = [
-        '//div[contains(., "Anti-bot confirmation")]',
-        '//div[contains(., "Confirm you are human")]',
-        '//div[contains(., "I am not a robot")]',
-    ]
-    for selector in selectors:
-        try:
-            if any(elem.is_displayed() for elem in sb.driver.find_elements(By.XPATH, selector)):
-                return True
-        except Exception:
-            continue
-    return False
+    """只把当前可见的 Anti-bot 弹窗当成续期验证，避免匹配到页面上隐藏的旧节点。"""
+    try:
+        return bool(sb.driver.execute_script(
+            '''
+            return [...document.querySelectorAll('[role="dialog"]')].some((el) => {
+              const style = window.getComputedStyle(el);
+              const visible = style.display !== 'none' && style.visibility !== 'hidden' && el.getAttribute('aria-hidden') !== 'true';
+              const text = el.innerText || '';
+              return visible && /Anti-bot confirmation|Confirm you are human/.test(text);
+            });
+            '''
+        ))
+    except Exception:
+        return False
 
 def get_cap_widget_state(sb):
     """读取 Cap 验证组件当前状态：initial / verifying / done / error / missing。
@@ -456,7 +458,14 @@ def get_cap_widget_state(sb):
     """
     return sb.driver.execute_script(
         '''
-        const hosts = document.querySelectorAll('cap-widget');
+        const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter((el) => {
+          const style = window.getComputedStyle(el);
+          const visible = style.display !== 'none' && style.visibility !== 'hidden' && el.getAttribute('aria-hidden') !== 'true';
+          return visible && /Anti-bot confirmation|Confirm you are human/.test(el.innerText || '');
+        });
+        const hosts = dialogs.length
+          ? dialogs[dialogs.length - 1].querySelectorAll('cap-widget')
+          : document.querySelectorAll('cap-widget');
         for (const host of hosts) {
           if (!host.shadowRoot) continue;
           const box = host.shadowRoot.querySelector('.captcha');
@@ -470,7 +479,14 @@ def find_cap_trigger(sb):
     """定位 Cap 组件里 "Verify you're human" 前面的复选框（shadow DOM 内）。"""
     return sb.driver.execute_script(
         '''
-        const hosts = document.querySelectorAll('cap-widget');
+        const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter((el) => {
+          const style = window.getComputedStyle(el);
+          const visible = style.display !== 'none' && style.visibility !== 'hidden' && el.getAttribute('aria-hidden') !== 'true';
+          return visible && /Anti-bot confirmation|Confirm you are human/.test(el.innerText || '');
+        });
+        const hosts = dialogs.length
+          ? dialogs[dialogs.length - 1].querySelectorAll('cap-widget')
+          : document.querySelectorAll('cap-widget');
         for (const host of hosts) {
           if (!host.shadowRoot) continue;
           const trigger = host.shadowRoot.querySelector('.captcha-trigger');
@@ -945,7 +961,10 @@ def fetch_new_expiry_from_projects(sb, service_id, timeout=30):
         sb.open(PROJECTS_URL)
         sb.wait_for_ready_state_complete()
         sb.sleep(3)
-        xpath = f'//article[contains(normalize-space(.), "{service_id}")]'
+        xpath = (
+            f'//*[(@data-service-id="{service_id}") or '
+            f'(self::article or self::li)[contains(normalize-space(.), "{service_id}")]]'
+        )
         start_time = time.time()
         while time.time() - start_time < timeout:
             rows = [r for r in sb.driver.find_elements(By.XPATH, xpath) if r.is_displayed()]
@@ -999,19 +1018,267 @@ def fill_input(sb, selector, value, label, timeout=15):
 
     return entered_value == value
 
-def login(sb, email, password):
-    """执行登录，返回是否成功"""
-    print("开始登录流程...")
 
-    # ---- 填写邮箱 ----
-    if not fill_input(sb, '#username', email, '邮箱'):
+def is_auth_title(title):
+    lowered = (title or '').strip().lower()
+    markers = ('sign in', 'log in', 'login', 'connexion', "s'inscrire", 'register', 'inscription')
+    return any(marker in lowered for marker in markers)
+
+
+def dismiss_cookie_banner(sb):
+    """登录页可能弹出 cookie 同意条，拒绝即可，避免挡住输入框。"""
+    xpath = (
+        '//div[@id="cookie-banner"]//button['
+        'contains(., "Tout refuser") or contains(., "Reject") or '
+        'contains(., "Refuser") or contains(., "Deny") or contains(., "拒绝")]'
+    )
+    try:
+        buttons = [b for b in sb.driver.find_elements(By.XPATH, xpath) if b.is_displayed()]
+    except Exception:
+        buttons = []
+    if not buttons:
+        try:
+            buttons = [
+                b for b in sb.driver.find_elements(By.CSS_SELECTOR, '#cookie-banner button')
+                if b.is_displayed() and any(word in (element_text(b) or '').lower() for word in ('refus', 'reject', 'deny', '拒绝'))
+            ]
+        except Exception:
+            buttons = []
+    for button in buttons:
+        if safe_click_element(sb, button, 'Cookie 同意条'):
+            print('已关闭 Cookie 同意条。')
+            sb.sleep(0.5)
+            return True
+    return False
+
+
+def first_visible_selector(sb, selectors, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for selector in selectors:
+            try:
+                if sb.is_element_visible(selector):
+                    return selector
+            except Exception:
+                continue
+        sb.sleep(0.3)
+    return ''
+
+
+def read_project_service_rows(sb):
+    """读取 My services 列表。2026-11 起 Renew 在 /dashboard/projects 的服务行上。"""
+    try:
+        rows = sb.driver.execute_script(
+            r'''
+            return [...document.querySelectorAll('li[data-service-id]')].map((row) => {
+              const name = ((row.querySelector('h3') || {}).innerText || '').trim();
+              const spans = [...row.querySelectorAll('span')]
+                .map((span) => (span.innerText || '').trim())
+                .filter(Boolean);
+              const expiry = spans.find((text) => /\d{1,2}[\/-]\d{1,2}[\/-]\d{4}|\d{4}-\d{2}-\d{2}/.test(text)) || '';
+              const status = spans.find((text) => /^(expired|active|suspended|paused|pending|running)$/i.test(text)) || '';
+              const renew = [...row.querySelectorAll('button')].find((button) => (button.innerText || '').trim().toLowerCase() === 'renew');
+              const manage = row.querySelector('a[href*="/server/"]');
+              return {
+                serviceId: row.getAttribute('data-service-id') || '',
+                name,
+                expiry,
+                status,
+                manageHref: manage ? (manage.getAttribute('href') || '') : '',
+                text: (row.innerText || '').replace(/\s+/g, ' ').trim(),
+                canRenew: !!(renew && !renew.disabled && renew.getAttribute('aria-busy') !== 'true'),
+              };
+            });
+            '''
+        )
+        return rows or []
+    except Exception as e:
+        print(f'读取服务列表失败: {e}')
+        return []
+
+
+def click_project_renew_button(sb, service_id):
+    button = sb.driver.execute_script(
+        '''
+        const row = document.querySelector('li[data-service-id="' + arguments[0] + '"]');
+        if (!row) return null;
+        return [...row.querySelectorAll('button')].find((item) => (item.innerText || '').trim() === 'Renew') || null;
+        ''',
+        service_id,
+    )
+    if button is None:
+        return False
+    return safe_click_element(sb, button, f'[{service_id}] Renew按钮')
+
+
+def wait_for_projects_renew_result(sb, service_id, old_expiry, timeout=50):
+    """弹窗关闭后，过期日变化或状态不再是 Expired，即视为续期成功。"""
+    start_time = time.time()
+    note = ''
+    reloaded_at = set()
+    while time.time() - start_time < timeout:
+        try:
+            if has_renew_antibot_modal(sb):
+                note = 'Cap 验证弹窗尚未关闭'
+                sb.sleep(1)
+                continue
+
+            rows = read_project_service_rows(sb)
+            row = next((item for item in rows if item.get('serviceId') == service_id), None)
+            elapsed = time.time() - start_time
+            needs_reload = row is None or (
+                old_expiry and old_expiry != '未知' and row and (row.get('expiry') or old_expiry) == old_expiry and (
+                    (elapsed > 8 and 8 not in reloaded_at) or (elapsed > 20 and 20 not in reloaded_at)
+                )
+            )
+            if needs_reload:
+                mark = 0 if row is None and 0 not in reloaded_at else (8 if 8 not in reloaded_at else 20)
+                if mark not in reloaded_at:
+                    reloaded_at.add(mark)
+                    sb.open(PROJECTS_URL)
+                    sb.wait_for_ready_state_complete()
+                    sb.sleep(2)
+                    continue
+            if row is None:
+                return True, '服务已不在列表中'
+
+            new_expiry = row.get('expiry') or extract_date_like(row.get('text') or '')
+            status = (row.get('status') or '').lower()
+            row_text = (row.get('text') or '').lower()
+            if old_expiry and old_expiry != '未知' and new_expiry and new_expiry != old_expiry:
+                return True, new_expiry
+            if status and status not in ('expired', 'suspended', 'paused') and 'expired' not in row_text:
+                return True, new_expiry or status
+            if not row.get('canRenew') and 'expired' not in row_text and 'renew' not in row_text:
+                return True, new_expiry or 'Renew 按钮已消失'
+            note = f'过期时间仍为 {new_expiry or old_expiry}'
+        except Exception as e:
+            note = f'检查续期结果时暂时失败: {e}'
+        sb.sleep(1)
+    return False, note or '等待续期结果超时'
+
+
+def renew_services_on_projects_page(sb):
+    processed = 0
+    max_services = 10
+    seen_ids = set()
+    while processed < max_services:
+        rows = [
+            row for row in read_project_service_rows(sb)
+            if row.get('canRenew') and row.get('serviceId') not in seen_ids
+        ]
+        if not rows:
+            break
+
+        row = rows[0]
+        project_name = row.get('name') or '未知服务'
+        service_id = row.get('serviceId') or ''
+        old_expiry = row.get('expiry') or extract_date_like(row.get('text') or '') or '未知'
+        if service_id:
+            seen_ids.add(service_id)
+        print(f"[{project_name}] 当前过期: {old_expiry}（服务ID: {service_id or '未知'}）")
+
+        try:
+            if not click_project_renew_button(sb, service_id):
+                print(f"[{project_name}] 未能点击 Renew 按钮。")
+                processed += 1
+                continue
+            print(f"[{project_name}] 点击 Renew...")
+            captcha_ok = handle_renew_antibot(sb, project_name)
+            if not captcha_ok:
+                print(f"[{project_name}] Cap 验证未完成，尝试点击 Cancel 关闭弹窗。")
+                cancel_renew_antibot_dialog(sb)
+
+            success, result_note = wait_for_projects_renew_result(sb, service_id, old_expiry, timeout=50)
+            refreshed = next((item for item in read_project_service_rows(sb) if item.get('serviceId') == service_id), None)
+            new_expiry = (refreshed or {}).get('expiry') or (extract_date_like(result_note) if success else '') or old_expiry
+            if success:
+                print(f"续期成功！状态: {result_note}，新过期: {new_expiry}")
+                send_telegram(build_success_message(project_name, old_expiry, new_expiry))
+                sb.open(PROJECTS_URL)
+                sb.wait_for_ready_state_complete()
+                time.sleep(2)
+            else:
+                print(f"续期状态未确认: {result_note}")
+                send_telegram(build_unconfirmed_message(project_name, old_expiry, new_expiry, result_note))
+        except Exception as e:
+            print(f"处理 [{project_name}] 出错: {e}")
+            send_telegram("🇫🇷 Aclclouds 续期通知\n\n⚠️ 处理出错: " + str(e))
+
+        processed += 1
+    return processed
+
+
+def renew_services_on_legacy_dashboard(sb):
+    """旧版首页 Upcoming renewals 表格。新版没有这张表时不会走到这里。"""
+    processed = 0
+    max_services = 10
+    while processed < max_services:
+        renew_buttons = find_dashboard_renew_buttons(sb)
+        if not renew_buttons:
+            break
+
+        row_text = get_dashboard_row_info(sb, renew_buttons[0])
+        project_name, service_id, old_expiry = parse_dashboard_row(row_text)
+        print(f"[{project_name}] 当前过期: {old_expiry}（服务ID: {service_id or '未知'}）")
+
+        try:
+            safe_click_element(sb, renew_buttons[0], f"[{project_name}] Renew按钮")
+            print(f"[{project_name}] 点击 Renew...")
+            captcha_ok = handle_renew_antibot(sb, project_name)
+            if not captcha_ok:
+                print(f"[{project_name}] Cap 验证未完成，尝试点击 Cancel 关闭弹窗。")
+                cancel_renew_antibot_dialog(sb)
+
+            success, result_note = wait_for_dashboard_renew_result(sb, service_id, old_expiry, timeout=40)
+            if success:
+                new_expiry = fetch_new_expiry_from_projects(sb, service_id)
+                print(f"续期成功！状态: {result_note}，新过期: {new_expiry}")
+                send_telegram(build_success_message(project_name, old_expiry, new_expiry))
+                sb.open(DASHBOARD_URL)
+                sb.wait_for_ready_state_complete()
+                time.sleep(2)
+            else:
+                print(f"续期状态未确认: {result_note}")
+                send_telegram(build_unconfirmed_message(project_name, old_expiry, old_expiry, result_note))
+        except Exception as e:
+            print(f"处理 [{project_name}] 出错: {e}")
+            send_telegram("🇫🇷 Aclclouds 续期通知\n\n⚠️ 处理出错: " + str(e))
+
+        processed += 1
+    return processed
+
+
+def login(sb, email, password):
+    """执行登录，返回是否成功。
+
+    2026-11 起登录成功后的标题是 My services | ACLClouds，
+    不能再断言旧标题 Home | ACLClouds。
+    """
+    print("开始登录流程...")
+    dismiss_cookie_banner(sb)
+
+    email_selector = first_visible_selector(sb, [
+        '#username',
+        'input[name="username"]',
+        'input[type="email"]',
+        'input[autocomplete="username"]',
+    ])
+    password_selector = first_visible_selector(sb, [
+        '#password',
+        'input[name="password"]',
+        'input[type="password"]',
+    ])
+    if not email_selector or not password_selector:
+        print(f"⚠️ 未找到登录输入框。邮箱: {email_selector or '无'}，密码: {password_selector or '无'}")
+        return False
+
+    if not fill_input(sb, email_selector, email, '邮箱'):
         print("⚠️ 邮箱仍未能正确填入，可能页面有动态行为。")
 
-    # ---- 填写密码 ----
-    if not fill_input(sb, '#password', password, '密码'):
+    if not fill_input(sb, password_selector, password, '密码'):
         print("⚠️ 密码仍未能正确填入。")
 
-    # ---- 验证码（2026-10 改版：Cap 组件，点击复选框后等 5 秒检查绿色对勾）----
     captcha_ok = click_captcha_checkbox(sb, '登录验证码', timeout=15)
     if not captcha_ok:
         print("⚠️ 登录验证码未完成，暂不点击登录按钮，避免直接提交。")
@@ -1019,56 +1286,68 @@ def login(sb, email, password):
 
     sb.sleep(2)
 
-    # ---- 点击登录按钮 ----
     login_page_url = sb.get_current_url()
     clicked = False
-
-    # 优先尝试提交按钮
-    for selector in ['button[type="submit"]', 'div.auth-submit-btn',
-                     '//button[contains(text(), "Sign in")]',
-                     '//div[contains(text(), "Sign in")]']:
+    sign_in_selectors = [
+        'button[type="submit"]',
+        'div.auth-submit-btn',
+        '//button[normalize-space(.)="Sign in" or normalize-space(.)="Se connecter" or normalize-space(.)="Connexion"]',
+        '//div[normalize-space(.)="Sign in" or normalize-space(.)="Se connecter"]',
+    ]
+    for selector in sign_in_selectors:
         try:
             sb.wait_for_element_visible(selector, timeout=5)
             scroll_to_selector(sb, selector)
+            try:
+                sb.wait_for_element_clickable(selector, timeout=8)
+            except Exception:
+                pass
             sb.click(selector)
             clicked = True
-            print(f"点击 Sign in 使用: {selector}")
+            print(f"点击登录按钮使用: {selector}")
             break
         except Exception as e:
             print(f"选择器 {selector} 失败: {e}")
     if not clicked:
         print("所有选择器失败，使用 JS 点击")
-        sb.execute_script('''
+        clicked = bool(sb.execute_script('''
+            var labels = ['Sign in', 'Se connecter', 'Connexion'];
             var els = document.querySelectorAll('div, button, a');
             for (var el of els) {
-                if (el.textContent.trim() === 'Sign in') {
+                if (labels.indexOf((el.textContent || '').trim()) !== -1) {
                     el.click();
                     return true;
                 }
             }
             return false;
-        ''')
+        '''))
 
-    # ---- 等待登录结果 ----
     try:
-        wait_for_url_change(sb, login_page_url, timeout=30)
-        if '/auth/login' not in sb.get_current_url():
-            sb.assert_title('Home | ACLClouds')
-            print("✅ 登录成功！")
+        try:
+            wait_for_url_change(sb, login_page_url, timeout=30)
+        except Exception as e:
+            if not is_logged_in(sb):
+                raise e
+            print(f"登录 URL 未变化，但当前已不在登录页: {e}")
+
+        current_url = sb.get_current_url()
+        title = sb.get_title() or ''
+        if is_logged_in(sb) and not is_auth_title(title):
+            print(f"✅ 登录成功！URL: {current_url}，标题: {title}")
             return True
-        else:
-            # 提取错误信息
-            error_msg = ""
-            try:
-                errors = sb.driver.find_elements(By.CSS_SELECTOR, '.auth-error-text, .alert-danger, .error-message')
-                error_msg = errors[0].text.strip() if errors else ''
-            except:
-                pass
-            print(f"❌ 登录失败，错误: {error_msg}")
-            return False
+
+        error_msg = ""
+        try:
+            errors = sb.driver.find_elements(By.CSS_SELECTOR, '.auth-error-text, .alert-danger, .error-message')
+            error_msg = errors[0].text.strip() if errors else ''
+        except Exception:
+            pass
+        print(f"❌ 登录失败，URL: {current_url}，标题: {title}，错误: {error_msg}")
+        return False
     except Exception as e:
         print(f"登录过程异常: {e}")
         return False
+
 
 def _curl_ip(ipv6):
     flag = "-6" if ipv6 else "-4"
@@ -1216,65 +1495,43 @@ def run_browser_session() -> bool:
             send_telegram("⚠️ 未能确认登录状态，请检查账号密码配置。")
             return False
 
-        # 2. 进入 dashboard 首页
-        sb.open(DASHBOARD_URL)
+        # 2. 进入 My services。首页已经没有 Upcoming renewals 表格。
+        sb.open(PROJECTS_URL)
         sb.wait_for_ready_state_complete()
         time.sleep(3)
 
         # 3. 关闭登录后的 Notifications 通知弹窗（如有，点 Dismiss 即可）
         close_notifications_popup(sb)
 
-        # 4. 逐个点击 Upcoming renewals 里的 Renew 按钮并完成 Cap 人机验证
-        processed = 0
-        max_services = 10  # 防止异常页面导致死循环
-        while processed < max_services:
-            renew_buttons = find_dashboard_renew_buttons(sb)
-            if not renew_buttons:
-                break
-
-            row_text = get_dashboard_row_info(sb, renew_buttons[0])
-            project_name, service_id, old_expiry = parse_dashboard_row(row_text)
-            print(f"[{project_name}] 当前过期: {old_expiry}（服务ID: {service_id or '未知'}）")
-
-            try:
-                safe_click_element(sb, renew_buttons[0], f"[{project_name}] Renew按钮")
-                print(f"[{project_name}] 点击 Renew...")
-                captcha_ok = handle_renew_antibot(sb, project_name)
-                if not captcha_ok:
-                    print(f"[{project_name}] Cap 验证未完成，尝试点击 Cancel 关闭弹窗。")
-                    cancel_renew_antibot_dialog(sb)
-
-                success, result_note = wait_for_dashboard_renew_result(sb, service_id, old_expiry, timeout=40)
-                if success:
-                    new_expiry = fetch_new_expiry_from_projects(sb, service_id)
-                    print(f"续期成功！状态: {result_note}，新过期: {new_expiry}")
-                    send_telegram(build_success_message(project_name, old_expiry, new_expiry))
-                    # 回到 dashboard 继续处理剩余服务
-                    sb.open(DASHBOARD_URL)
-                    sb.wait_for_ready_state_complete()
-                    time.sleep(2)
-                else:
-                    print(f"续期状态未确认: {result_note}")
-                    send_telegram(build_unconfirmed_message(project_name, old_expiry, old_expiry, result_note))
-            except Exception as e:
-                print(f"处理 [{project_name}] 出错: {e}")
-                send_telegram(f"🇫🇷 Aclclouds 续期通知\n\n⚠️ 处理出错: {str(e)}")
-
-            processed += 1
-
-        if processed == 0:
-            body_text = ''
-            try:
-                body_text = sb.driver.find_element(By.TAG_NAME, 'body').text
-            except Exception:
-                pass
-            if 'No renewal is currently available' in body_text:
-                print("当前没有可续期的服务。")
-                send_telegram(build_not_yet_due_message('（无待续期服务）', 'No renewal is currently available'))
+        project_rows = read_project_service_rows(sb)
+        if any(row.get('canRenew') for row in project_rows):
+            renew_services_on_projects_page(sb)
+        else:
+            sb.open(DASHBOARD_URL)
+            sb.wait_for_ready_state_complete()
+            time.sleep(2)
+            close_notifications_popup(sb)
+            if find_dashboard_renew_buttons(sb):
+                print("项目页没有 Renew，回退到旧版 dashboard 续期表。")
+                renew_services_on_legacy_dashboard(sb)
+            elif project_rows:
+                expiry = project_rows[0].get('expiry') or project_rows[0].get('status') or '未知'
+                name = project_rows[0].get('name') or '（无待续期服务）'
+                print(f"当前没有可点击的 Renew 按钮。服务: {project_rows[0].get('text')}")
+                send_telegram(build_not_yet_due_message(name, expiry))
             else:
-                print("❌ 未在 dashboard 找到 Renew 按钮。")
-                log_projects_page_diagnostics(sb)
-                send_telegram("⚠️ 未在 dashboard 找到 Renew 按钮，请检查页面结构。")
+                body_text = ''
+                try:
+                    body_text = sb.driver.find_element(By.TAG_NAME, 'body').text
+                except Exception:
+                    pass
+                if 'No renewal is currently available' in body_text:
+                    print("当前没有可续期的服务。")
+                    send_telegram(build_not_yet_due_message('（无待续期服务）', 'No renewal is currently available'))
+                else:
+                    print("❌ 未在 My services 找到 Renew 按钮。")
+                    log_projects_page_diagnostics(sb)
+                    send_telegram("⚠️ 未在 My services 找到 Renew 按钮，请检查页面结构。")
 
         print("所有项目处理完成。")
         return True
